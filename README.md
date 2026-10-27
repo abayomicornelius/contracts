@@ -1,377 +1,140 @@
-# StellarSend Contracts
+# StellarPOS Contracts
 
-Soroban smart contracts powering the [StellarSend](https://github.com/StellarSend) global money transfer platform. All contracts are written in Rust and deployed on the Stellar network.
+Soroban smart contracts for StellarPOS, a point-of-sale system for merchants
+who accept payment on the Stellar network.
 
----
+[![CI](https://github.com/StellarPOS-App/contracts/actions/workflows/ci.yml/badge.svg)](https://github.com/StellarPOS-App/contracts/actions/workflows/ci.yml)
+![soroban-sdk](https://img.shields.io/badge/soroban--sdk-27.0.6-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
 
-## Table of Contents
+This repository is one of three:
 
-- [Architecture Overview](#architecture-overview)
-- [Contracts](#contracts)
-  - [stellar\_send](#stellar_send)
-  - [fee\_collector](#fee_collector)
-  - [token\_bridge](#token_bridge)
-- [Getting Started](#getting-started)
-- [Building](#building)
-- [Testing](#testing)
-- [Deployment](#deployment)
-- [Contract API Reference](#contract-api-reference)
-- [Events](#events)
-- [Security](#security)
-- [Contributing](#contributing)
-- [License](#license)
+| Repository | What it is |
+|---|---|
+| [`contracts`](https://github.com/StellarPOS-App/contracts) (this repo) | On-chain settlement, loyalty, treasury and escrow |
+| [`backend`](https://github.com/StellarPOS-App/backend) | REST + WebSocket API: catalog, sales, checkout, payment matching |
+| [`surface`](https://github.com/StellarPOS-App/surface) | The point-of-sale web app cashiers and managers use |
 
----
+## The contracts
 
-## Architecture Overview
+| Crate | Purpose | Key entry points |
+|---|---|---|
+| [`merchant-registry`](contracts/merchant-registry/src/lib.rs) | Who may get paid, where funds settle, which assets each merchant takes | `register`, `approve`, `suspend`, `accepts`, `settlement_of` |
+| [`payment-processor`](contracts/payment-processor/src/lib.rs) | Atomic sale settlement: fee to treasury, net to merchant, one payment per order | `pay`, `pay_batch`, `refund`, `payment_for_order`, `quote` |
+| [`loyalty-program`](contracts/loyalty-program/src/lib.rs) | Per-merchant points with automatic Bronze/Silver/Gold/Platinum tiers | `enroll`, `accrue`, `redeem`, `get_account` |
+| [`treasury`](contracts/treasury/src/lib.rs) | M-of-N multisig that holds protocol fees and can put idle funds into approved yield vaults | `propose`, `approve`, `execute`, `freeze`, `vaults` |
+| [`escrow-service`](contracts/escrow-service/src/lib.rs) | Held payments for deliveries and pre-orders, with dispute resolution | `create`, `release`, `claim`, `raise_dispute`, `resolve`, `resolve_by_default` |
+| [`payment-stream`](contracts/payment-stream/src/lib.rs) | Per-second payment streams for subscriptions, rent and payroll; cancel splits earned and unearned exactly | `create`, `withdraw`, `cancel`, `available` |
+| [`shared`](contracts/shared/src/lib.rs) | Library, not deployed: basis-point fee math and storage TTL helpers | `bps_of`, `split_fee`, `extend_*` |
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                      User / dApp                        │
-└──────────────────────┬──────────────────────────────────┘
-                       │ send_payment / send_path_payment
-                       ▼
-┌─────────────────────────────────────────────────────────┐
-│               stellar_send  (Entry Point)               │
-│                                                         │
-│  • Validates sender + amount                            │
-│  • Deducts protocol fee (bps)                           │
-│  • Routes payment to recipient                          │
-│  • Emits PaymentSent / PathPaymentSent events           │
-└─────────┬───────────────────────────┬───────────────────┘
-          │ forward fee               │ DEX path swap
-          ▼                           ▼
-┌──────────────────────┐   ┌─────────────────────────────┐
-│    fee_collector     │   │       token_bridge           │
-│                      │   │                              │
-│  • Accumulates fees  │   │  • wrap / unwrap assets      │
-│  • Admin withdrawal  │   │  • Enables cross-asset       │
-│  • Per-token totals  │   │    path payments             │
-└──────────────────────┘   └─────────────────────────────┘
+### How a sale settles
+
+```mermaid
+sequenceDiagram
+    participant C as Customer wallet
+    participant P as payment-processor
+    participant R as merchant-registry
+    participant T as Token (SAC)
+    participant L as loyalty-program
+    C->>P: pay(payer, merchant, asset, amount, order_ref)
+    P->>R: accepts(merchant, asset)?
+    R-->>P: true
+    P->>R: settlement_of(merchant)
+    P->>T: transfer(payer -> settlement, net)
+    P->>T: transfer(payer -> treasury, fee)
+    P->>L: accrue(processor, merchant, payer, amount)
+    P-->>C: payment id (event: payment_settled)
 ```
 
-The system is intentionally modular: `stellar_send` is the only contract that end users interact with directly. `fee_collector` and `token_bridge` are infrastructure contracts managed by the protocol admin.
+All transfers happen inside one transaction, so either the whole sale settles
+or nothing moves. The processor never holds customer funds, and the
+`(merchant, order_ref)` pair is unique, so a retried checkout cannot charge
+twice.
 
----
+### Design rules
 
-## Contracts
+These hold across every contract:
 
-### stellar\_send
+- **Typed errors, no panics on user input.** Each contract has a
+  `#[contracterror]` enum. Clients get a stable numeric code for every
+  rejection.
+- **Events for every state change**, defined with `#[contractevent]`, so the
+  backend and indexers can follow everything without polling storage.
+- **Emergency pause.** Registry, processor, loyalty and escrow can be paused
+  by their admin. Escrow refunds still work while paused, because returning
+  funds to a buyer is always safe. The treasury uses a multisig freeze
+  instead.
+- **Checked arithmetic.** Fee and split math goes through `shared::bps_of`,
+  which returns `None` on overflow or on more than 100%.
+- **TTL management.** Every read or write of a long-lived record extends its
+  TTL, so active data is never archived.
 
-**Path:** `contracts/stellar_send/`
+More detail on each contract, including state machines and storage layout, is
+in [docs/architecture.md](docs/architecture.md).
 
-The main entry point for the StellarSend protocol. Supports direct token transfers and DEX path payments between any Stellar addresses.
-
-| Feature | Description |
-|---|---|
-| Direct payments | Transfer any SEP-41 token from sender to recipient |
-| Path payments | Route through the Stellar DEX for cross-asset transfers |
-| Fee deduction | Protocol fee in basis points (bps), deducted at source |
-| Pause / unpause | Admin can halt new payments in an emergency |
-| Payment records | Every transfer is stored on-ledger for auditability |
-| Admin rotation | Two-step admin handover (propose → accept) |
-
-**Key data types:**
-
-```rust
-pub struct ContractConfig {
-    pub admin: Address,
-    pub fee_bps: u32,          // 100 bps = 1%
-    pub fee_collector: Address,
-    pub active: bool,
-    pub min_amount: i128,
-    pub max_amount: i128,
-}
-
-pub struct PaymentRecord {
-    pub from: Address,
-    pub to: Address,
-    pub token: Address,
-    pub net_amount: i128,
-    pub fee_amount: i128,
-    pub memo: String,
-    pub ledger: u32,
-}
-```
-
----
-
-### fee\_collector
-
-**Path:** `contracts/fee_collector/`
-
-Receives protocol fees forwarded by `stellar_send` and allows the treasury admin to withdraw accumulated balances.
-
-| Feature | Description |
-|---|---|
-| Fee accounting | Tracks lifetime totals collected per token |
-| Withdrawal | Admin-only; supports arbitrary recipient |
-| Treasury management | Treasury address updatable by admin |
-| Period limits | Configurable withdrawal limit per epoch |
-| Multi-token | Operates on any SEP-41 token |
-
----
-
-### token\_bridge
-
-**Path:** `contracts/token_bridge/`
-
-A lightweight wrap / unwrap bridge for non-native Stellar assets. Users deposit an underlying token and receive an equal amount of wrapped tokens, enabling cross-asset path payments through the StellarSend DEX flow.
-
-| Feature | Description |
-|---|---|
-| wrap | Deposit underlying → receive wrapped balance |
-| unwrap | Burn wrapped balance → receive underlying |
-| Bridge fee | Configurable bps fee on wrap operations |
-| Supply cap | Configurable maximum wrapped supply |
-| Pause / unpause | Admin can halt wrapping in an emergency |
-| Admin rotation | Two-step admin handover |
-
----
-
-## Getting Started
+## Getting started
 
 ### Prerequisites
 
-| Tool | Version | Install |
-|---|---|---|
-| Rust | stable (see `rust-toolchain.toml`) | `curl https://sh.rustup.rs -sSf \| sh` |
-| Soroban CLI | ≥ 21.0.0 | `cargo install --locked soroban-cli` |
-| wasm32 target | — | `rustup target add wasm32-unknown-unknown` |
+- Rust stable with the `wasm32v1-none` target (pinned in
+  [`rust-toolchain.toml`](rust-toolchain.toml), installed automatically by
+  rustup)
+- [Stellar CLI](https://developers.stellar.org/docs/tools/cli) 23 or newer,
+  for building optimized wasm and deploying
 
-### Clone and install
+### Build and test
 
 ```bash
-git clone https://github.com/StellarSend/contracts.git
+git clone https://github.com/StellarPOS-App/contracts.git
 cd contracts
+
+make test      # 63 tests across all crates
+make check     # rustfmt + clippy -D warnings + tests (what CI runs)
+make build     # optimized wasm in target/wasm32v1-none/release/
+make sizes     # wasm sizes, all well under the 64 KB limit
+make verify    # check a deployment runs exactly this source (NETWORK=testnet)
 ```
 
-The workspace `Cargo.toml` pins all dependency versions. No additional install step is required.
-
----
-
-## Building
-
-Build all contracts to WASM:
+### Deploy to testnet
 
 ```bash
-make build
-# or directly:
-bash scripts/build.sh
+make deploy                      # NETWORK=testnet, FEE_BPS=100 by default
+NETWORK=testnet FEE_BPS=250 make deploy
 ```
 
-Individual contract:
+[`scripts/deploy.sh`](scripts/deploy.sh) creates and funds a deployer
+identity if needed, deploys all five contracts, initializes them, connects
+the loyalty program to the processor, and writes every contract ID to
+`deployments/<network>.json`. See [docs/deployment.md](docs/deployment.md)
+for the post-deploy checklist (multisig rotation, merchant onboarding) and
+example `stellar contract invoke` calls.
 
-```bash
-soroban contract build --package stellar_send
-soroban contract build --package fee_collector
-soroban contract build --package token_bridge
+## Project layout
+
 ```
-
-Compiled WASM files are written to `target/wasm32-unknown-unknown/release/`.
-
----
-
-## Testing
-
-Run the full test suite:
-
-```bash
-make test
-# or:
-bash scripts/test.sh
+contracts/
+  shared/               fee math and TTL helpers (rlib)
+  merchant-registry/
+  payment-processor/
+  loyalty-program/
+  treasury/
+  escrow-service/
+    src/dispute.rs      dispute reasons, role rules, default rulings
+    tests/              end-to-end dispute scenarios
+docs/                   architecture and deployment guides
+scripts/deploy.sh       deploy + initialize + wire
+deployments/            contract IDs per network (written by deploy.sh)
 ```
-
-Individual contract tests:
-
-```bash
-cargo test -p stellar_send
-cargo test -p fee_collector
-cargo test -p token_bridge
-```
-
-Run with output:
-
-```bash
-cargo test -p stellar_send -- --nocapture
-```
-
----
-
-## Deployment
-
-### Testnet
-
-```bash
-# Set environment
-export STELLAR_NETWORK=testnet
-export STELLAR_RPC_URL=https://soroban-testnet.stellar.org
-export STELLAR_ACCOUNT=<your-secret-key>
-
-# Deploy fee_collector first (stellar_send depends on its address)
-bash scripts/deploy.sh fee_collector
-
-# Deploy token_bridge
-bash scripts/deploy.sh token_bridge
-
-# Deploy stellar_send, passing fee_collector address
-bash scripts/deploy.sh stellar_send <fee_collector_address>
-```
-
-### Mainnet
-
-Same steps as testnet; update `STELLAR_NETWORK=mainnet` and `STELLAR_RPC_URL=https://horizon.stellar.org`.
-
-> **Note:** Mainnet deployments require a multi-sig admin key. Refer to the [Security](#security) section.
-
----
-
-## Contract API Reference
-
-### stellar\_send
-
-#### `initialize(admin, fee_bps, fee_collector) → Result<(), StellarSendError>`
-
-Initialise the contract. Must be called exactly once by `admin`.
-
-- `fee_bps`: Protocol fee in basis points. Range: `0..=10_000`.
-- `fee_collector`: Address of the deployed `fee_collector` contract.
-
-#### `send_payment(from, to, token, amount, memo) → Result<PaymentRecord, StellarSendError>`
-
-Transfer `amount` of `token` from `from` to `to`. The protocol fee is deducted from `amount` before transfer.
-
-**Requires auth from:** `from`
-
-#### `send_path_payment(from, to, send_token, send_amount, dest_token, min_dest_amount, path) → Result<i128, StellarSendError>`
-
-Route a payment through the Stellar DEX. The fee is deducted from `send_amount` before the swap is attempted.
-
-**Requires auth from:** `from`
-
-#### `set_fee(new_fee_bps) → Result<(), StellarSendError>`
-
-Update the protocol fee. **Admin only.**
-
-#### `pause() / unpause() → Result<(), StellarSendError>`
-
-Halt or resume new payments. **Admin only.**
-
-#### `transfer_admin(new_admin) → Result<(), StellarSendError>`
-
-Propose a new admin (step 1 of 2). **Current admin only.**
-
-#### `accept_admin() → Result<(), StellarSendError>`
-
-Complete the admin rotation (step 2 of 2). **Proposed admin only.**
-
-#### `get_config() → Result<ContractConfig, StellarSendError>`
-
-Return current configuration.
-
-#### `get_payment_record(from, seq) → Result<PaymentRecord, StellarSendError>`
-
-Retrieve a stored payment record by sender address and sequence number.
-
----
-
-### fee\_collector
-
-#### `initialize(admin, treasury) → Result<(), FeeCollectorError>`
-
-#### `collect_fee(token, amount) → Result<(), FeeCollectorError>`
-
-Record fee receipt. The token transfer must already have been made by `stellar_send`.
-
-#### `withdraw(token, amount, recipient) → Result<(), FeeCollectorError>`
-
-Withdraw fees to `recipient`. **Admin only.**
-
-#### `get_balance(token) → i128`
-
-Return current token balance held by the contract.
-
-#### `get_total_collected(token) → i128`
-
-Return the lifetime total of fees collected in `token`.
-
----
-
-### token\_bridge
-
-#### `initialize(admin, underlying_token) → Result<(), TokenBridgeError>`
-
-#### `wrap(from, amount) → Result<i128, TokenBridgeError>`
-
-Deposit `amount` of underlying token; credit wrapped balance.
-
-#### `unwrap(from, amount) → Result<i128, TokenBridgeError>`
-
-Burn `amount` of wrapped balance; return underlying tokens.
-
-#### `get_wrapped_balance(holder) → i128`
-
-#### `get_underlying_token() → Result<Address, TokenBridgeError>`
-
----
-
-## Events
-
-All contracts emit structured events consumable by the Horizon API or Soroban event subscriptions.
-
-| Contract | Topic | Data |
-|---|---|---|
-| stellar_send | `payment_sent` | `(from, to, token, net_amount, fee_amount, memo)` |
-| stellar_send | `path_payment_sent` | `(from, to, send_token, send_amount, dest_token, dest_amount, fee_amount)` |
-| stellar_send | `fee_updated` | `(old_bps, new_bps)` |
-| stellar_send | `paused / unpaused` | `ledger` |
-| fee_collector | `fee_received` | `(token, amount)` |
-| fee_collector | `fee_withdrawn` | `(token, recipient, amount)` |
-| token_bridge | `wrapped` | `(underlying, amount)` |
-| token_bridge | `unwrapped` | `(underlying, amount)` |
-
-Subscribe to events via Horizon:
-
-```bash
-soroban events --contract-id <CONTRACT_ID> --network testnet
-```
-
----
-
-## Security
-
-### Admin key management
-
-- All admin keys should be multi-sig accounts on mainnet.
-- Admin rotation uses a two-step propose/accept pattern to prevent key loss.
-- The `fee_collector` treasury address is separate from the admin key.
-
-### Audit status
-
-| Contract | Auditor | Status |
-|---|---|---|
-| stellar\_send | — | In progress |
-| fee\_collector | — | In progress |
-| token\_bridge | — | In progress |
-
-### Reporting vulnerabilities
-
-Please report security issues privately via email to **security@stellarsend.io**. Do **not** open a public issue for a security vulnerability. See [SECURITY.md](SECURITY.md) for our responsible disclosure policy.
-
----
 
 ## Contributing
 
-We welcome contributions! Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
-
-1. Fork the repo
-2. Create a feature branch: `git checkout -b feat/my-feature`
-3. Make your changes and add tests
-4. Run `make test` — all tests must pass
-5. Open a PR against `main`
-
----
+Read [CONTRIBUTING.md](CONTRIBUTING.md). In short: open an issue first for
+anything non-trivial, keep pull requests focused, and run `make check`
+before pushing. Security issues go through [SECURITY.md](SECURITY.md), never
+public issues.
 
 ## License
 
-MIT © 2026 StellarSend. See [LICENSE](LICENSE) for full text.
+[MIT](LICENSE)
+
+## Storage Access Optimization\n\n**Performance note (issue #175):** Multiple env().storage().persistent().get() calls with the same key in one invocation should be collapsed into a single read cached in a local variable, reducing ledger I/O and transaction fees.
